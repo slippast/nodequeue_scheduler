@@ -1,0 +1,660 @@
+<?php
+
+/**
+ * @file
+ * Nodequeue scheduler module
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function nodequeue_scheduler_permission() {
+  return array(
+    'schedule publishing of nodes to nodequeue' => array(
+      'title' => t('Schedule content publication to nodequeue'),
+      'description' => t('Allows users to schedule content publication to nodequeue'),
+    ),
+    'schedule unpublishing of nodes to nodequeue' => array(
+      'title' => t('Schedule content to unpublish from nodequeue'),
+      'description' => t('Allows users to schedule content to unpublish nodequeue'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function nodequeue_scheduler_cron() {
+	// cron to add items to the nodequeue
+  //dpm('cron run');
+
+  // Some house cleaning - is this needed?
+	$num_deleted = db_delete('nodequeue_scheduler')
+		->condition('qid', 0)
+		->execute();
+		if($num_deleted) {
+			watchdog('Nodequeue Scheduler', 'Nodequeue Scheduler housekeeping: %num orphaned events deleted.', array('%num' => $num_deleted), 'WATCHDOG_NOTICE');
+		}
+
+  //dpm(date('D, d M Y H:i:s',REQUEST_TIME));
+  //dpm('part 1');
+
+  $query = db_select('nodequeue_scheduler', 'ns')
+		->fields('ns', array('nid', 'qid', 'publish_on', 'unpublish_on'))
+		->condition('publish_on', REQUEST_TIME, '<')
+		->condition('publish_on', 0, '!=')
+		->execute();
+
+  //dpm('part 2');
+  while ($row = $query->fetchObject()) {
+    //dpm($row);
+		if($row->qid) {
+      //dpm('part 3 - loop main query');
+			$queue = nodequeue_load($row->qid);
+			$node = node_load($row->nid);
+			$subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+
+			// Add new items to the queue
+      // Adjust scheduler as necessary.
+			foreach ($subqueues as $subqueue) {
+        //dpm('part 4 - loop subqueue');
+				//First off, add the item(s) to the queue
+				nodequeue_subqueue_add($queue, $subqueue, $node->nid);
+        //watchdog('Nodequeue-scheduler', '%title was added to %queue by Nodequeue Scheduler.', array('%title' => $node->title, '%queue' => $queue->title), 'WATCHDOG_NOTICE');
+          //dpm('part 5');
+          // A little Ill Logic...
+          // If there's an 'unpublish on' time we want to keep the
+          // {nodequeue_scheduler} entry and update it in order to remove
+          // the 'publish on' time. Otherwise just delete the entry, we
+          // won't need it later.
+          if($row->unpublish_on != 0) {
+            //dpm('part 6 - update');
+            _nodequeue_scheduler_delete($node, $subqueue->qid);
+            nodequeue_scheduler_insert_query($node->nid, $subqueue->qid, $publish_on = 0, $row->unpublish_on);
+          } else {
+            //dpm('part 7 - full delete');
+            _nodequeue_scheduler_delete($node, $subqueue->qid);
+          }	
+  			}
+  	  }
+		}
+
+  //dpm('part 8 - delete unscheduled items');
+	// Cron to remove items scheduled to unpublish from a nodequeue.
+  $query = db_select('nodequeue_scheduler', 'ns')
+		->fields('ns', array('nid', 'qid', 'publish_on', 'unpublish_on'))
+		->condition('unpublish_on', REQUEST_TIME, '<')
+		->condition('unpublish_on', 0, '!=')
+		->execute();
+  while ($row = $query->fetchObject()) {
+    //dpm($row);
+		if($row->qid) {
+			$queue = nodequeue_load($row->qid);
+			$node = node_load($row->nid);
+			$subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+    	foreach ($subqueues as $subqueue) {
+        //dpm($subqueue);
+        nodequeue_scheduler_remove($subqueue->qid, $subqueue->sqid, $node->nid);
+        _nodequeue_scheduler_delete($node, $subqueue->qid);
+      }
+    }
+  }
+}
+
+
+
+
+/**
+ * Backup delete function.
+ * Because nodequeue_subqueue_remove_node doesn't fucking work.
+ */
+function nodequeue_scheduler_remove($qid, $sqid, $nid) {
+	// Delete node id from nodequeue
+	$nodequeue_delete = db_delete('nodequeue_nodes')
+		->condition('qid', $qid)
+		->condition('sqid', $sqid)
+		->condition('nid', $nid)
+		->execute();
+	return($nodequeue_delete);
+}
+
+
+/**
+ * Implements hook_form_alter().
+ */
+function nodequeue_scheduler_form_alter(&$form, $form_state) {
+  // Is this a node form and scheduling has been enabled for this node type
+  if (!empty($form['#node_edit_form']) && user_access('schedule publishing of nodes to nodequeue')) {
+
+    // Set some defaults.
+    $node = $form['#node'];
+    $active_queues = array();
+    $default_queues = array();
+    $default_date_publish = NULL;
+    $default_date_unpublish = NULL;
+    $default_dates = array();
+
+    // If this is a preview then get the values from the form, not the db.
+    if (isset($form_state['values']['op']) && $form_state['values']['op'] == t('Preview')) {
+      // What is this stuff again?
+      // Preview the node? Does anyone do that?
+      /*
+      $default_date = !empty($form_state['values']['nodequeue_publish_on']) ? $form_state['values']['nodequeue_publish_on'] : NULL;
+      foreach ($form_state['values']['nodequeue_publish_queue'] as $key => $value) {
+        if (!empty($value)) {
+          $default_queues[$value] = $value;
+        }
+      }
+      */
+    } elseif(isset($node->nid) && $node->nid > 0) {
+      $default_dates = _nodequeue_scheduler_load($node); 
+      foreach ($default_dates as $key => $value) {
+        $default_queues[$key] = $key;
+      }
+		}
+
+    //Add the vertical tab
+    $form['nodequeue_scheduling'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Nodequeue scheduling'),
+      '#collapsible' => TRUE,
+      '#group' => 'additional_settings',
+/*
+      '#attached' => array(
+        'js' => array(
+          'vertical-tabs' => drupal_get_path('module', 'nodequeue_scheduler') . "/nodequeue_scheduler_vertical_tabs.js"
+        ),
+      )
+*/
+    );
+
+    // First let's get a list of all the available queues
+    // for this content type.
+    $options = array();
+    $queues = nodequeue_load_queues_by_type($form['#node']->type, 'tab');
+    foreach ($queues as $key => $value) {
+      $options[$value->qid] = !empty($value->subqueue_title) ? $value->subqueue_title : $value->title;
+    }
+    ksort($options);
+
+    // We need to disocver if this node is already in any queues
+    // and then we should list them to make life easier on the user.
+		$query = db_select('nodequeue_nodes', 'nn')
+			->fields('nn', array('qid', 'sqid', 'nid', 'position', 'timestamp', 'weight'))
+			->condition('nid', $node->nid)
+			->execute();
+		while ($row = $query->fetchObject()) {
+			$active_queues[$row->qid] = $row->qid;
+		}
+
+    if(!empty($active_queues)) {
+      $active_queues = nodequeue_load_subqueues($active_queues);
+    }
+    
+    // Here is where we build the text list of the queues
+    // to which this node already belongs.
+    $i = 0;
+    $count = count($active_queues);
+    $queues = '';
+    foreach($active_queues as $key => $value){
+      if($i < ($count - 1)) {
+       $queues .= $value->title . ', '; 
+      } else {
+        $queues .= $value->title;
+      }
+      $i++;
+    }
+    // Now show the summary details
+    if(!empty($queues)){
+      $form['nodequeue_scheduling']['current_queues'] = array(
+        '#markup' => t("This node is already assigned to the following queues: <em>@current_queues</em>.<br /><br /><h2>Available Queues</h2>", array('@current_queues' => $queues)),
+        '#weight' => -10,
+      );
+    }
+
+    // Time format for the popup calendar.
+    $format = 'Y-m-d g:ia';
+    $o = 0;
+
+    // Build the dynamic form...
+    foreach($options as $key => $value) {
+      $option = array($key => $value);
+      $group_key = 'ns_group'.$key;
+      $check_key = 'ns_check'.$key;
+      $publish_key = 'ns_publish'.$key;
+      $unpublish_key = 'ns_unpublish'.$key;
+
+      $form['nodequeue_scheduling'][$group_key] = array(
+        '#type' => 'fieldset',
+        '#collapsible' => FALSE,
+        '#collapsed' => FALSE,
+        '#weight' => 1,
+        '#group' => 'nodequeue_scheduling',
+      );
+
+      if(array_key_exists($key, $default_queues)) {
+        // Let's add a little helpful text to show if the node
+        // is in the current queue or if it's scheduled.
+        // Set the default items.
+        $default[$key] = $key;
+        $default_extra = ' | <span class="marker">scheduled</span>';
+        // Let's get the default date values since were here.
+        if(!empty($default_dates)) {
+          foreach($default_dates as $date_key => $date_value) {
+            if($date_key == $key) {
+              if(isset($date_value['publish']) && $date_value['publish'] != 0) {
+                $default_date_publish = date('Y-m-d H:i', $date_value['publish']);
+              }
+              if(isset($date_value['unpublish']) && $date_value['unpublish'] != 0) {
+                $default_date_unpublish = date('Y-m-d H:i', $date_value['unpublish']);
+              }
+            }
+          }
+        }
+      } else {
+        $default = array(0);
+        $default_extra = ' | <span>not scheduled</span>';
+      }
+
+      $active = 0;
+      $scheduled = 0;
+      // Locate the current items via an array search.
+      if (array_key_exists($key, $active_queues)) {
+        $current = array($key => $key);
+        $active = 1;
+      } elseif(array_key_exists($key, $default_dates)) {
+        $current = array($key => $key);
+        $scheduled = 1;
+      } else {
+        $current = '';
+      }
+      // Now add the helpful text.
+      if(!empty($current)){
+        foreach($option as $key => $value) {
+          if($active == 1) {
+            $option[$key] = $value . ' | <span class="marker">in queue</span>' . $default_extra;
+            $disabled = TRUE;
+          } else {
+            $option[$key] = $value . $default_extra;
+            $disabled = FALSE;
+          }
+        }
+      } else {
+        $disabled = FALSE;
+      }
+
+      // Here come the important scheduling fields.
+      $form['nodequeue_scheduling'][$group_key][$check_key] = array(
+        '#type' => 'checkboxes',
+        '#options' => $option,
+        '#default_value' => $default,
+        '#weight' => 2,
+        '#group' => 'nodequeue_scheduling',
+      );
+
+      // Publish date.
+      $form['nodequeue_scheduling'][$group_key][$publish_key] = array(
+        '#type' => 'date_popup',
+        '#title' => t('Publish to <em>@name queue</em>', array('@name' => $value)),
+        '#date_format' => $format,
+        '#date_increment' => 15,
+        '#date_year_range' => '0:+2',
+        '#default_value' => $default_date_publish,
+        '#weight' => 3,
+        '#required' => FALSE,
+        '#disabled' => $disabled,
+        '#group' => 'nodequeue_scheduling',
+        '#states' => array(
+          'invisible' => array(
+            ':input[name="'.$check_key.'['.$key.']"]' => array('checked' => FALSE),
+          ),
+        ),
+      );
+
+      // Unpublish date.
+      $form['nodequeue_scheduling'][$group_key][$unpublish_key] = array(
+        '#type' => 'date_popup',
+        '#title' => t('Unpublish from <em>@name queue</em>', array('@name' => $value)),
+        '#date_format' => $format,
+        '#date_increment' => 15,
+        '#date_year_range' => '0:+2',
+        '#default_value' => $default_date_unpublish,
+        '#weight' => 4,
+        '#required' => FALSE,
+        '#group' => 'nodequeue_scheduling',
+        '#states' => array(
+          'invisible' => array(
+            ':input[name="'.$check_key.'['.$key.']"]' => array('checked' => FALSE),
+          ),
+        ),
+      );
+
+    // We're in a loop so clear some default variables.
+    unset($default);
+    $default_extra = '';
+    $default_date_publish = '';
+    $default_date_unpublish = '';
+    $o++;
+  }
+
+  $form['nodequeue_scheduling']['notes'] = array(
+    '#markup' => t("<p><strong>Note:</strong> If you check the box for a queue but you do not select a publish start date the node will be immediately added to that queue.  If no unpublish date is selected the node will remain in the queue until manually removed.</p><p>To remove the publishing dates simply uncheck the box next to the queue title and save the node. To remove items from the assigned queues <a href='/node/@nid/nodequeue'>click here</a>.</p>", array('@nid' => $node->nid)),
+    '#weight' => 10,
+  );
+
+  }
+}
+
+
+/**
+ * Implements hook_node_submit().
+ */
+function nodequeue_scheduler_node_submit($node, $form, &$form_state) {
+  $values = $form_state['values'];
+
+  // Since items aren't being properly grouped as I expected
+  // I have the pull the dynamically created items out of the
+  // submitted values array for the Node.
+  // Yes this is ugly but I can't find a better way...
+  // 1 - Search the array for the check value.
+  // 2 - Build a list of the results.
+  // 3 - Then rebuild the array of results
+  // 4 - Use those results to build the data to save the content
+  $pattern = '/\b(ns_check\w*)\b/';
+  $check = array_intersect_key($values, array_flip(preg_grep($pattern, array_keys($values))));
+  //dpm($check);
+  
+  foreach($check as $item) {
+    $item = array_filter($item);
+    if(!empty($item)) {
+      foreach($item as $key) {
+        $ns_container[$key]['nid'] = $node->nid;
+        $ns_container[$key]['sqid'] = $key;
+
+        $pattern_1 = '/\b(ns_publish'.$key.')\b/';
+        $ns_publish = strtotime(current(array_intersect_key($values, array_flip(preg_grep($pattern_1, array_keys($values))))));
+        if(!empty($ns_publish)) {
+          $ns_container[$key]['ns_publish'] = $ns_publish;
+        } else {
+          $ns_container[$key]['ns_publish'] = NULL;
+        }
+
+        $pattern_2 = '/\b(ns_unpublish'.$key.')\b/';
+        $ns_unpublish = strtotime(current(array_intersect_key($values, array_flip(preg_grep($pattern_2, array_keys($values))))));
+        if(!empty($ns_unpublish)) {
+          $ns_container[$key]['ns_unpublish'] = $ns_unpublish;
+        } else {
+          $ns_container[$key]['ns_unpublish'] = NULL;
+        }
+      }
+    }
+  }
+  if(isset($ns_container)) {
+    $node->ns_containers = $ns_container;
+  }
+  $node->ns_check = TRUE;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function nodequeue_scheduler_node_insert($node) {
+  _nodequeue_scheduler_save($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function nodequeue_scheduler_node_update($node) {
+  _nodequeue_scheduler_save($node);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function nodequeue_scheduler_node_delete($node) {
+  _nodequeue_scheduler_delete($node);
+}
+
+/**
+ * Helper function to perform the insert into the scheduler
+ */
+function nodequeue_scheduler_insert_query($nid, $sqid, $publish_on = 0, $unpublish_on = 0) {
+  // Save the data
+  if(db_insert('nodequeue_scheduler')
+    ->fields(array(
+    'nid' => $nid,
+    'qid' => $sqid,
+    'publish_on' => $publish_on,
+    'unpublish_on' => $unpublish_on,
+    ))
+    ->execute()) {
+    return TRUE; 
+  } else {
+    return FALSE; 
+  }
+}
+
+/**
+ * Helper function to write scheduled nodes to DB.
+ */
+function _nodequeue_scheduler_save($node) {
+  // If this wasn't submitted by the node edit form just skip it.
+  if(isset($node->ns_check)) {
+    if(isset($node->ns_containers)) {
+      $ns_containers = $node->ns_containers;
+    } else {
+      $ns_containers = array(); 
+    }
+
+    // Default containers
+    $default_dates = array();
+    $active_queues = array();
+
+    // We need to disocver if this node is already in any queues
+    // and then we should list them to make life easier on the user.
+    $query = db_select('nodequeue_nodes', 'nn')
+      ->fields('nn', array('qid', 'sqid', 'nid', 'position', 'timestamp', 'weight'))
+      ->condition('nid', $node->nid)
+      ->execute();
+    while ($row = $query->fetchObject()) {
+      $active_queues[$row->qid] = $row->qid;
+    }
+
+    $default_dates = _nodequeue_scheduler_load($node);
+    //dpm($ns_containers);
+    //dpm($active_queues);
+    //dpm($default_dates);
+  
+    // ** House Keeping **
+    // First is the 'remove phase'.
+    // Do a reverse check to find out items
+    // that should be unscheduled because the user
+    // unchecked the box for that queue.
+    foreach($default_dates as $sqid => $value) {
+      if(!array_key_exists($sqid, $ns_containers)) {
+          _nodequeue_scheduler_delete($node, $sqid);
+        } elseif(!$ns_containers) {
+      }
+    }
+    /*foreach($active_queues as $active_queue) {
+      if(!array_key_exists($active_queue, $ns_containers)) {
+        _nodequeue_scheduler_delete($node, $active_queue);
+      } 
+    }*/
+    // If all containers are empty but there are dates scheduled
+    // remove all associated schedule dates.
+    if(!isset($ns_containers) && isset($default_dates)) {
+      foreach($default_dates as $sqid => $value) {
+        _nodequeue_scheduler_delete($node, $sqid);
+      }
+    }
+
+    // Second we'll deal with our list of items
+    foreach($ns_containers as $ns_container) {
+      //dpm($ns_container);
+      // We'll need the queue name for messages
+      $queue_name = nodequeue_load_subqueue($ns_container['sqid']);
+  
+      // Dates can't be null so let's do a quick check just for the insert phase.
+      if($ns_container['ns_publish'] == NULL) {
+        $publish_on = '0';
+      } else {
+        $publish_on = $ns_container['ns_publish']; 
+      }
+      if($ns_container['ns_unpublish'] == NULL) {
+        $unpublish_on = '0';
+      } else {
+        $unpublish_on = $ns_container['ns_unpublish']; 
+      }
+  
+      // Let's see if this container is already in a queue
+      // This might come in useful
+      if(array_key_exists($ns_container['sqid'], $active_queues)) {
+        $active = 1;
+      } else {
+        $active = 0;
+      }
+      $added = 0;
+  
+      // How about some super basic error checking?
+      // And some friendly warnings...
+      // And we'll do some thinking for the users
+      if($publish_on == 0 && $unpublish_on == 0) {
+        _nodequeue_scheduler_delete($node, $ns_container['sqid']);
+      }
+      if($publish_on != 0 && $unpublish_on != 0) {
+        if($publish_on > $unpublish_on) {
+          drupal_set_message(t('Nodequeue Scheduler: <strong>@queue_name</strong> - publish time should come before Unpublish time! Fix it or prepare for problems.', array('@queue_name' => $queue_name->title)), 'warning');
+        }
+      }
+      // If the 'publish_on' date has already passed we
+      // should add it to the queue immediately.
+      if($publish_on != 0) {
+        if(REQUEST_TIME > $publish_on) {
+          $added = 1;
+          $publish_on = '0';
+          $queue = nodequeue_load($ns_container['sqid']);
+          $subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+          // Add item to the queue
+          foreach ($subqueues as $subqueue) {
+            nodequeue_subqueue_add($queue, $subqueue, $node->nid);
+            drupal_set_message(t('Nodequeue Scheduler: Publish time has already passed! The node was immediately added to the <strong>@queue_name</strong> queue.', array('@queue_name' => $queue_name->title)), 'warning');
+          }
+        }
+      }
+      // If the 'unpublish_on' date has already passed we
+      // should remove it from the queue immediately.
+      if($unpublish_on != 0) {
+        if(REQUEST_TIME > $unpublish_on) {
+          $queue = nodequeue_load($ns_container['sqid']);
+          //Remove the entry, we don't need it anymore
+          $subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+          //dpm($subqueues);
+          foreach ($subqueues as $subqueue) {
+            nodequeue_scheduler_remove($subqueue->qid, $subqueue->sqid, $node->nid);
+            _nodequeue_scheduler_delete($node, $ns_container['sqid']);
+            $unpublish_on = '0';
+          }
+          drupal_set_message(t('Nodequeue Scheduler: Unpublish time has already passed! Node will be removed immediately from the <strong>@queue_name</strong> queue.', array('@queue_name' => $queue_name->title)), 'warning');
+        }
+      }
+  
+      // Now is the 'add phase'
+      // Right now if the date fields are empty we just give a warning.
+      if(!isset($ns_container['ns_publish']) && !isset($ns_container['ns_unpublish'])) {
+        // Check to see if the node is alread in a queue,
+        // if so warn them that they've made a mistake.
+        if($active == 0) {
+          drupal_set_message(t('No dates were selected for the <strong>@queue_name</strong> queue. No action was taken.', array('@queue_name' => $queue_name->title)), 'warning');
+  
+          /*// I'm keeping this around in case I ever decide to use this functionality
+          // This is what we do when we need to add the node directly
+          // i.e., no schedule was selected.
+          $queue = nodequeue_load($ns_container['sqid']);
+          $subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+          // Add new items to the queue
+          foreach ($subqueues as $subqueue) {
+            nodequeue_subqueue_add($queue, $subqueue, $node->nid);
+            drupal_set_message(t('This node was added to the <em>@queue_name</em> queue.', array('@queue_name' => $queue_name->title)), 'status');
+          }*/
+        } else {
+          drupal_set_message(t('This node is already in the <strong>@queue_name</strong> queue. Since no unpublish date was selected no action was taken.', array('@queue_name' => $queue_name->title)), 'warning');
+        }
+      }
+  
+      // Now add/update the scheduled items.
+      if(isset($ns_container['ns_publish']) || isset($ns_container['ns_unpublish'])) {
+        if(array_key_exists($ns_container['sqid'], $default_dates)) {
+          //dpm('This item is already set to publish. Remove that date and add the new one that was just submitted.');
+        }
+        // If they selected an unpublish date but left the publication date
+        // empty, and the item isn't already in a queue let's just drop it
+        // in the queue immediately...let the user sort it out.
+        if($publish_on == 0 && $unpublish_on != 0 && $active != 1 && $added != 1) {
+          // I'm just going to keep this here in case I change my mind about how this should work.
+          /*$queue = nodequeue_load($ns_container['sqid']);
+          $subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
+            _nodequeue_scheduler_delete($node, $ns_container['sqid']);
+          foreach ($subqueues as $subqueue) {
+            nodequeue_subqueue_add($queue, $subqueue, $node->nid);
+            nodequeue_scheduler_insert_query($node->nid, $ns_container['sqid'], $publish_on, $unpublish_on);
+            // Send back a confirmation response
+            $confirm_message .= ' - Unpublish: <em>' . date('D, d M Y H:i', $unpublish_on) . '</em>';
+            drupal_set_message(t('An unpublish date was set, but there is no publish scheduled and the node is not already assigned to any queues.  So we added it immediately to the following queue: <strong>@queue_name</strong>. @confirm_message.', array('@queue_name' => $queue->title, '@confirm_message' => $confirm_messagen)), 'warning');
+          }*/
+          
+          // In the meantime just warn them that they've done wrong
+          // and move on.
+          drupal_set_message(t('An unpublish date was set <strong>@queue_name</strong> queue. But no publish date was added and the node is not already assigned to any queues. No action was taken.', array('@queue_name' => $queue_name->title)), 'warning');
+  
+        } else {
+          //First delete all entries for this node related to the current sqid.
+          _nodequeue_scheduler_delete($node, $ns_container['sqid']);
+          // Second insert the entries that were just submitted.
+          if($publish_on != 0 || $unpublish_on != 0) {
+            if(nodequeue_scheduler_insert_query($node->nid, $ns_container['sqid'], $publish_on, $unpublish_on)) {
+              // Send back a confirmation response
+              $confirm_message = '';
+              if($publish_on) {
+                $confirm_message .= ' - Publish: <em>' . date('D, d M Y H:i', $publish_on) . '</em>';
+              }
+              if($unpublish_on) {
+                $confirm_message .= ' - Unpublish: <em>' . date('D, d M Y H:i', $unpublish_on) . '</em>';
+              }
+              drupal_set_message(t('This node was scheduled to the following queue: <em>@queue_name</em>. @confirm_message.', array('@queue_name' => $queue_name->title, '@confirm_message' => $confirm_messagen)), 'status');
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to load nodequeue scheduler data from DB.
+ */
+function _nodequeue_scheduler_load($node) {
+  $result = array();
+  $query = db_select('nodequeue_scheduler', 'ns')
+    ->fields('ns', array('qid', 'publish_on', 'unpublish_on'))
+  	->condition('nid', $node->nid)
+    ->execute();
+  while ($row = $query->fetchObject()) {
+    $result[$row->qid]['nid'] = $node->nid;
+    $result[$row->qid]['publish'] = $row->publish_on;
+		$result[$row->qid]['unpublish'] = $row->unpublish_on;
+  }
+  return $result;
+}
+
+/**
+ * Helper function to delete nodequeue scheduler data from DB.
+ */
+function _nodequeue_scheduler_delete($node, $qid = 0) {
+  if($qid == 0) {
+    db_query("DELETE FROM {nodequeue_scheduler} WHERE nid=:nid", array(':nid' => $node->nid));
+  } else {
+    db_query("DELETE FROM {nodequeue_scheduler} WHERE nid=:nid AND qid=:qid", array(':nid' => $node->nid, ':qid' => $qid)); 
+  }
+}

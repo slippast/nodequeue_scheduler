@@ -1,0 +1,14 @@
+name = Nodequeue-scheduler
+description = This module allows nodes to be published or unpublished to a nodequeue on a specified date and time.
+core = 7.x
+package = Nodequeue
+files[] = nodequeue_scheduler.install
+files[] = nodequeue_scheduler.module
+dependencies[] = nodequeue
+dependencies[] = date_popup
+; Information added by drupal.org packaging script on 2013-10-01
+version = "7.x-1.x-dev"
+core = "7.x"
+project = "nodequeue_scheduler"
+datestamp = "1380593565"
+
