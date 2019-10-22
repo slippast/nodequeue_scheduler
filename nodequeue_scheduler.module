@@ -26,18 +26,13 @@ function nodequeue_scheduler_permission() {
  */
 function nodequeue_scheduler_cron() {
 	// cron to add items to the nodequeue
-  //dpm('cron run');
-
-  // Some house cleaning - is this needed?
+  // Some house cleaning
 	$num_deleted = db_delete('nodequeue_scheduler')
 		->condition('qid', 0)
 		->execute();
-		if($num_deleted) {
+	if($num_deleted) {
 			watchdog('Nodequeue Scheduler', 'Nodequeue Scheduler housekeeping: %num orphaned events deleted.', array('%num' => $num_deleted), 'WATCHDOG_NOTICE');
 		}
-
-  //dpm(date('D, d M Y H:i:s',REQUEST_TIME));
-  //dpm('part 1');
 
   $query = db_select('nodequeue_scheduler', 'ns')
 		->fields('ns', array('nid', 'qid', 'publish_on', 'unpublish_on'))
@@ -45,11 +40,8 @@ function nodequeue_scheduler_cron() {
 		->condition('publish_on', 0, '!=')
 		->execute();
 
-  //dpm('part 2');
   while ($row = $query->fetchObject()) {
-    //dpm($row);
 		if($row->qid) {
-      //dpm('part 3 - loop main query');
 			$queue = nodequeue_load($row->qid);
 			$node = node_load($row->nid);
 			$subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
@@ -57,29 +49,25 @@ function nodequeue_scheduler_cron() {
 			// Add new items to the queue
       // Adjust scheduler as necessary.
 			foreach ($subqueues as $subqueue) {
-        //dpm('part 4 - loop subqueue');
 				//First off, add the item(s) to the queue
 				nodequeue_subqueue_add($queue, $subqueue, $node->nid);
         //watchdog('Nodequeue-scheduler', '%title was added to %queue by Nodequeue Scheduler.', array('%title' => $node->title, '%queue' => $queue->title), 'WATCHDOG_NOTICE');
-          //dpm('part 5');
+
           // A little Ill Logic...
           // If there's an 'unpublish on' time we want to keep the
           // {nodequeue_scheduler} entry and update it in order to remove
           // the 'publish on' time. Otherwise just delete the entry, we
           // won't need it later.
           if($row->unpublish_on != 0) {
-            //dpm('part 6 - update');
             _nodequeue_scheduler_delete($node, $subqueue->qid);
             nodequeue_scheduler_insert_query($node->nid, $subqueue->qid, $publish_on = 0, $row->unpublish_on);
           } else {
-            //dpm('part 7 - full delete');
             _nodequeue_scheduler_delete($node, $subqueue->qid);
           }	
   			}
   	  }
 		}
 
-  //dpm('part 8 - delete unscheduled items');
 	// Cron to remove items scheduled to unpublish from a nodequeue.
   $query = db_select('nodequeue_scheduler', 'ns')
 		->fields('ns', array('nid', 'qid', 'publish_on', 'unpublish_on'))
@@ -87,22 +75,17 @@ function nodequeue_scheduler_cron() {
 		->condition('unpublish_on', 0, '!=')
 		->execute();
   while ($row = $query->fetchObject()) {
-    //dpm($row);
 		if($row->qid) {
 			$queue = nodequeue_load($row->qid);
 			$node = node_load($row->nid);
 			$subqueues = nodequeue_get_subqueues_by_node(array($queue), $node);
     	foreach ($subqueues as $subqueue) {
-        //dpm($subqueue);
         nodequeue_scheduler_remove($subqueue->qid, $subqueue->sqid, $node->nid);
         _nodequeue_scheduler_delete($node, $subqueue->qid);
       }
     }
   }
 }
-
-
-
 
 /**
  * Backup delete function.
